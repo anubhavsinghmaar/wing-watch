@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WingWatch Delhi - Bird Migration Tracker</title>
+    <meta name="description"
+        content="Track migratory and resident birds in Delhi NCR with real-time arrival boards and species information">
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <h1 class="logo">🦅 WingWatch Delhi</h1>
+            <p class="tagline">Migratory & Resident Birds of Delhi NCR</p>
+        </div>
+    </header>
+
+    <!-- Navigation -->
+    <nav class="nav-tabs">
+        <div class="container">
+            <button class="tab-button active" data-tab="dashboard">Dashboard</button>
+            <button class="tab-button" data-tab="birdCalls">Bird Calls</button>
+            <button class="tab-button" data-tab="species">Species Explorer</button>
+            <button class="tab-button" data-tab="settings">Settings</button>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <div class="container">
+
+            <!-- Dashboard Tab -->
+            <section id="dashboardView" class="tab-content active">
+                <div class="dashboard-layout">
+                    <!-- Filter Panel -->
+                    <aside class="filter-panel">
+                        <h2>Filters</h2>
+
+                        <div class="filter-group">
+                            <label for="locationFilter">Location</label>
+                            <select id="locationFilter">
+                                <option value="">All Locations</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label for="birdSearch">Search Bird</label>
+                            <input type="text" id="birdSearch" placeholder="Search by name...">
+                        </div>
+
+                        <div class="filter-group">
+                            <label for="categoryFilter">Category</label>
+                            <select id="categoryFilter">
+                                <option value="">All Categories</option>
+                                <option value="Waterfowl">Waterfowl</option>
+                                <option value="Waders">Waders</option>
+                                <option value="Gulls and Terns">Gulls and Terns</option>
+                                <option value="Raptors">Raptors</option>
+                                <option value="Residents">Residents</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label>Status</label>
+                            <div class="checkbox-group">
+                                <label>
+                                    <input type="checkbox" value="Not sighted" checked> Not sighted
+                                </label>
+                                <label>
+                                    <input type="checkbox" value="Spotted low numbers" checked> Spotted low numbers
+                                </label>
+                                <label>
+                                    <input type="checkbox" value="Peak season" checked> Peak season
+                                </label>
+                            </div>
+                        </div>
+                    </aside>
+
+                    <!-- Bird Cards Grid -->
+                    <div class="cards-container">
+                        <div id="birdCardsGrid" class="bird-cards-grid">
+                            <!-- Cards will be rendered here by JavaScript -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Bird Calls Tab -->
+            <section id="birdCallsView" class="tab-content">
+                <div class="bird-calls-container">
+                    <h2>Bird Call Analyzer</h2>
+
+                    <div class="info-banner">
+                        <p class="info-text">
+                            <strong>🔒 Secure Audio Analysis:</strong> This feature sends your audio clip securely to
+                            Gemini using your own API key.
+                            It tries to guess which bird from the WingWatch list is calling.
+                            <strong>Treat results as hints, not final identification.</strong>
+                        </p>
+                    </div>
+
+                    <div class="upload-form">
+                        <div class="upload-section">
+                            <label for="audioFile" class="file-label">Upload Audio File</label>
+                            <input type="file" id="audioFile" accept="audio/*">
+                            <p class="small-text">Supported formats: .mp3, .wav, .m4a</p>
+
+                            <div class="divider-text">OR</div>
+
+                            <!-- Recording Controls -->
+                            <div class="recording-controls">
+                                <button id="startRecordBtn" class="btn-record" type="button">
+                                    <span class="record-icon">●</span> Record Audio
+                                </button>
+
+                                <div id="recordingStatus" class="recording-status" style="display: none;">
+                                    <div class="recording-indicator"></div>
+                                    <span id="recordingTimer">00:00</span>
+                                    <button id="stopRecordBtn" class="btn-stop" type="button">Stop</button>
+                                </div>
+
+                                <div id="recordingPreview" class="recording-preview" style="display: none;">
+                                    <audio id="audioPlayback" controls></audio>
+                                    <div class="preview-actions">
+                                        <a id="downloadRecordLink" class="btn-secondary btn-small"
+                                            download="bird-call.webm">Download</a>
+                                        <button id="discardRecordBtn" class="btn-text" type="button">Discard</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="callLocation">Location</label>
+                            <select id="callLocation">
+                                <option value="">Select location...</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="habitatType">Habitat Type</label>
+                            <select id="habitatType">
+                                <option value="">Select habitat...</option>
+                                <option value="Wetland">Wetland</option>
+                                <option value="Woodland">Woodland</option>
+                                <option value="Urban">Urban</option>
+                                <option value="Grassland">Grassland</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="timeOfDay">Time of Day</label>
+                            <select id="timeOfDay">
+                                <option value="">Select time...</option>
+                                <option value="Dawn">Dawn</option>
+                                <option value="Morning">Morning</option>
+                                <option value="Afternoon">Afternoon</option>
+                                <option value="Evening">Evening</option>
+                                <option value="Night">Night</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div id="callError" class="error-message" style="display: none;"></div>
+                    <div id="callLoading" class="loading-message" style="display: none;">
+                        <div class="spinner"></div>
+                        <p>🎵 Listening and analyzing...</p>
+                    </div>
+
+                    <button id="analyzeCallBtn" class="btn-primary">Analyze Call</button>
+                </div>
+
+                <div id="callResults" class="call-results" style="display: none;">
+                    <h3>Probable Species</h3>
+                    <div id="speciesSuggestions"></div>
+                </div>
+        </div>
+        </section>
+
+        <!-- Species Explorer Tab -->
+        <section id="speciesView" class="tab-content">
+            <div class="species-layout">
+                <!-- Species List -->
+                <aside class="species-sidebar">
+                    <h2>Species</h2>
+
+                    <div class="filter-group">
+                        <label for="speciesSearch">Search</label>
+                        <input type="text" id="speciesSearch" placeholder="Search species...">
+                    </div>
+
+                    <div class="category-filters">
+                        <button class="category-btn active" data-category="">All</button>
+                        <button class="category-btn" data-category="Waterfowl">Waterfowl</button>
+                        <button class="category-btn" data-category="Waders">Waders</button>
+                        <button class="category-btn" data-category="Gulls and Terns">Gulls & Terns</button>
+                        <button class="category-btn" data-category="Raptors">Raptors</button>
+                        <button class="category-btn" data-category="Residents">Residents</button>
+                    </div>
+
+                    <div id="speciesList" class="species-list">
+                        <!-- Species list will be rendered here -->
+                    </div>
+                </aside>
+
+                <!-- Species Profile -->
+                <div class="species-profile">
+                    <div id="speciesDetail" class="species-detail-empty">
+                        <p>Select a bird species to view details</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Settings Tab -->
+        <section id="settingsView" class="tab-content">
+            <div class="settings-container">
+                <h2>Settings</h2>
+
+                <!-- API Configuration -->
+                <section class="settings-section">
+                    <h3>API Configuration</h3>
+                    <p class="info-text">
+                        Configure your own API keys for Perplexity and Gemini services.
+                        Keys are never hardcoded and are stored only in your browser if you choose to persist them.
+                    </p>
+
+                    <!-- Perplexity Config -->
+                    <div class="api-config-card">
+                        <h4>Perplexity API</h4>
+                        <p class="small-text">Used for conservation data and web research</p>
+
+                        <div class="form-group">
+                            <label for="perplexityKey">API Key</label>
+                            <input type="password" id="perplexityKey" placeholder="Enter your API key">
+                            <small>Get your key from <a href="https://www.perplexity.ai/settings/api"
+                                    target="_blank">perplexity.ai/settings/api</a></small>
+                        </div>
+                    </div>
+
+                    <!-- Gemini Config -->
+                    <div class="api-config-card">
+                        <h4>Gemini API</h4>
+                        <p class="small-text">Used for bird call analysis</p>
+
+                        <div class="form-group">
+                            <label for="geminiKey">API Key</label>
+                            <input type="password" id="geminiKey" placeholder="Enter your API key">
+                            <small>Get your key from <a href="https://makersuite.google.com/app/apikey"
+                                    target="_blank">Google AI Studio</a></small>
+                        </div>
+                    </div>
+
+                    <!-- Persistence Option -->
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="persistKeys">
+                            Store keys in this browser using localStorage
+                        </label>
+                        <p class="info-text small">
+                            ℹ️ Keys are only stored in your browser's localStorage and never sent to any server
+                            except the API providers (Perplexity and Google).
+                            All API requests go directly from your browser to the API providers.
+                        </p>
+                    </div>
+                    All API requests go directly from your browser to the API providers.
+                    </p>
+            </div>
+
+            <div class="button-group">
+                <button id="saveConfigBtn" class="btn-primary">Save Configuration</button>
+                <button id="resetKeysBtn" class="btn-secondary">Reset API Keys</button>
+            </div>
+        </section>
+
+        <!-- Data Management -->
+        <section class="settings-section">
+            <h3>Data Management</h3>
+
+            <div class="data-reset-card">
+                <h4>Reset Season Data</h4>
+                <p class="small-text">
+                    Clear all sighting reports, status updates, and arrival tracking data from your browser.
+                </p>
+                <button id="resetDataBtn" class="btn-danger">Reset Season Data</button>
+            </div>
+        </section>
+        </div>
+        </section>
+
+        </div>
+    </main>
+
+    <!-- Modals -->
+
+    <!-- Report Sighting Modal -->
+    <div id="reportModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Report Sighting</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="reportBirdInfo" class="bird-info-summary"></div>
+
+                <div class="form-group">
+                    <label for="sightingDate">Date</label>
+                    <input type="date" id="sightingDate">
+                </div>
+
+                <div class="form-group">
+                    <label>Approximate Count</label>
+                    <div class="radio-group">
+                        <label>
+                            <input type="radio" name="count" value="1-10" checked> 1 to 10
+                        </label>
+                        <label>
+                            <input type="radio" name="count" value="10-50"> 10 to 50
+                        </label>
+                        <label>
+                            <input type="radio" name="count" value="50+"> 50+
+                        </label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="observerName">Observer Name (Optional)</label>
+                    <input type="text" id="observerName" placeholder="Your name">
+                </div>
+
+                <div class="form-group">
+                    <label for="sightingNote">Notes (Optional)</label>
+                    <textarea id="sightingNote" rows="3" placeholder="Additional observations..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="cancelReportBtn" class="btn-secondary">Cancel</button>
+                <button id="saveReportBtn" class="btn-primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bird Detail Modal -->
+    <div id="birdDetailModal" class="modal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3 id="detailBirdName"></h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="birdDetailContent"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div id="confirmModal" class="modal">
+        <div class="modal-content modal-small">
+            <div class="modal-header">
+                <h3 id="confirmTitle">Confirm</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="confirmMessage"></p>
+            </div>
+            <div class="modal-footer">
+                <button id="confirmCancelBtn" class="btn-secondary">Cancel</button>
+                <button id="confirmOkBtn" class="btn-primary">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
