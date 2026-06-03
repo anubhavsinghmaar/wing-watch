@@ -7,7 +7,8 @@ const LOCATIONS = [
     { id: "okhla", name: "Okhla Bird Sanctuary" },
     { id: "najafgarh", name: "Najafgarh Jheel" },
     { id: "yamuna_khadar", name: "Yamuna Khadar" },
-    { id: "bhindawas", name: "Bhindawas" }
+    { id: "bhindawas", name: "Bhindawas" },
+    { id: "surajpur", name: "Surajpur Wetland" }
 ];
 
 const BIRDS = [
