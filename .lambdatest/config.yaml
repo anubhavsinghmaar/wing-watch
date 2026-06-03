@@ -1,0 +1,12 @@
+# LambdaTest AI Cloud Configuration
+
+# Project and folder configuration
+project_id: "01KS2EKGN6597H3QVTR7HHH6F4"
+folder_id: "01KS2EKGP11NXWR3E5G0K7T3EV"
+
+# Test Run configuration
+assignee: 3299667
+environment_id: 289340
+
+# Test URL for automation (live GitHub Pages deployment of WingWatch)
+test_url: "https://anubhavsinghmaar.github.io/wing-watch/"
