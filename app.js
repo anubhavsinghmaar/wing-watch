@@ -420,7 +420,7 @@ function initializeSeasonState() {
 }
 
 function saveSeasonState() {
-    localStorage.setItem("wingwatch_season_state_v1", JSON.stringify(seasonState));
+    localStorage.setItem("wingwatch_season_state_v1_DROPPED", JSON.stringify(seasonState)); // SEEDED BUG: writes to a key initializeSeasonState never reads, so status is lost on reload
 }
 
 function loadApiConfig() {
