@@ -22,6 +22,10 @@ inputs:
     description: "Kane run timeout (seconds)"
     required: false
     default: "180"
+  artifact-suffix:
+    description: "Optional suffix to keep the evidence artifact name unique when the same journey runs more than once in a single workflow run (e.g. best-of-3 attempts). Leave empty for one-shot journeys."
+    required: false
+    default: ""
 
 outputs:
   verdict:   { description: "PASS | FAIL | VOID", value: "${{ steps.run.outputs.verdict }}" }
@@ -76,6 +80,6 @@ runs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: kane-${{ inputs.journey }}
+        name: kane-${{ inputs.journey }}${{ inputs.artifact-suffix }}
         path: /tmp/kane_${{ inputs.journey }}.ndjson
         if-no-files-found: ignore

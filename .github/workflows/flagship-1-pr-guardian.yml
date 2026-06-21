@@ -102,6 +102,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
         run: |
+          # Root cause names ONLY the journey that actually failed, so the line never
+          # mashes a passing journey's summary into the failing one.
+          RC="(no failing journey captured a root cause)"
+          [ "${{ steps.j_filter.outputs.verdict }}" = "FAIL" ] && RC="location-filter: ${{ steps.j_filter.outputs.summary }}"
+          [ "${{ steps.j_season.outputs.verdict }}" = "FAIL" ] && RC="season-persistence: ${{ steps.j_season.outputs.summary }}"
           BODY=$(cat <<EOF
           ### KaneAI Guardian — verdict: FAILED
           | journey | verdict | evidence |
@@ -109,7 +114,7 @@ jobs:
           | season-persistence | ${{ steps.j_season.outputs.verdict }} | ${{ steps.j_season.outputs.summary }} |
           | location-filter | ${{ steps.j_filter.outputs.verdict }} | ${{ steps.j_filter.outputs.summary }} |
 
-          Root cause (from the Kane run): **${{ steps.j_season.outputs.summary }}${{ steps.j_filter.outputs.summary }}**
+          Root cause (from the Kane run): **$RC**
           Evidence: Kane run dirs (screenshots/network/console) attached as workflow artifacts; Test Manager: ${{ steps.j_season.outputs.test_url }}
           EOF
           )

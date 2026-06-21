@@ -97,6 +97,7 @@ jobs:
         uses: ./.github/actions/kane-journey
         with:
           journey: ${{ steps.cfg.outputs.journey }}
+          artifact-suffix: "-attempt1"
           objective: "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work, the first content paints promptly, and no application JavaScript error occurs during the interaction; fail if a real app error is thrown or the app's own features do not work."
           lt-username: ${{ secrets.LT_USERNAME }}
           lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
@@ -106,6 +107,7 @@ jobs:
         uses: ./.github/actions/kane-journey
         with:
           journey: ${{ steps.cfg.outputs.journey }}
+          artifact-suffix: "-attempt2"
           objective: "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work, the first content paints promptly, and no application JavaScript error occurs during the interaction; fail if a real app error is thrown or the app's own features do not work."
           lt-username: ${{ secrets.LT_USERNAME }}
           lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
@@ -115,6 +117,7 @@ jobs:
         uses: ./.github/actions/kane-journey
         with:
           journey: ${{ steps.cfg.outputs.journey }}
+          artifact-suffix: "-attempt3"
           objective: "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work, the first content paints promptly, and no application JavaScript error occurs during the interaction; fail if a real app error is thrown or the app's own features do not work."
           lt-username: ${{ secrets.LT_USERNAME }}
           lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
