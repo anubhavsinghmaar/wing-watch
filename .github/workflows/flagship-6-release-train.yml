@@ -202,9 +202,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]; then
             echo "would open guarded fix-branch PR (K=1, human-merge-only):"
             echo "  - Claude edits APP code only (never the test), low-risk fix"
             echo "  - branch fix/release-${{ github.run_id }} -> PR referencing Jira ${{ steps.jira.outputs.issue_key }}"

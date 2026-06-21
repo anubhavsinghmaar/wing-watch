@@ -14,7 +14,7 @@ Add every secret at **repo Settings → Secrets and variables → Actions → Ne
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
 | `LT_USERNAME` | required | required | required | required | required | required |
 | `LT_ACCESS_KEY` | required | required | required | required | required | required |
-| `ANTHROPIC_API_KEY` | select + auto-fix | — | — | — | diff plan | K=1 fix |
+| `CLAUDE_CODE_OAUTH_TOKEN` | select + auto-fix | — | — | — | diff plan | K=1 fix |
 | `DATADOG_API_KEY` | — | read | read | — | — | pre-gate read |
 | `DATADOG_APP_KEY` | — | read | read | — | — | pre-gate read |
 | `DATADOG_API_KEY` | — | — | — | read | — | — |
@@ -29,7 +29,7 @@ Add every secret at **repo Settings → Secrets and variables → Actions → Ne
 Notes on the matrix:
 
 - `LT_USERNAME` and `LT_ACCESS_KEY` are the only secrets the composite action consumes. Kane authenticates with Basic auth, which does not expire mid-run.
-- `ANTHROPIC_API_KEY` powers the Claude legs. In F1 it both selects which journeys the diff can break and drives the capped auto-fix. In F5 it does the diff classification. In F6 it drives the K=1 candidate fix. With no key, F1 and F5 fall back to running the full committed journey set, and F6 skips the repair and leaves the gate honest.
+- `CLAUDE_CODE_OAUTH_TOKEN` powers the Claude legs. In F1 it both selects which journeys the diff can break and drives the capped auto-fix. In F5 it does the diff classification. In F6 it drives the K=1 candidate fix. With no key, F1 and F5 fall back to running the full committed journey set, and F6 skips the repair and leaves the gate honest.
 - Datadog naming is not uniform across the set. F2, F3, and F6 read `DATADOG_API_KEY` plus `DATADOG_APP_KEY`. F4 reads `DATADOG_API_KEY` plus `DATADOG_APP_KEY`. Add whichever pair the workflow you are enabling actually references (the matrix rows above are split deliberately). Datadog access is read-only in every case; incidents are never created from inside these workflows.
 - `JIRA_PROJECT_KEY` selects the project a bug lands in. Without the full Jira set, the bug leg echoes "would create Jira bug: <summary>".
 - `SLACK_WEBHOOK` is an incoming-webhook URL. `PAGERDUTY_ROUTING_KEY` is an Events API v2 routing key, only used by F3.
@@ -52,7 +52,7 @@ This is the demo to run first. It reproduces a real "claimed success, no real ef
    ```
 3. Open a pull request from `demo/seeded-bug` into your default branch (in the GitHub UI or `gh pr create --head demo/seeded-bug`).
 4. Go to the **Actions** tab, pick **"Flagship 1 - PR-to-Production Guardian"**, click **Run workflow**, and set `pr_ref` to `demo/seeded-bug`.
-5. Expect the `season-persistence` journey to **FAIL** (the status is lost on reload), the merge gate (`kane/guardian` commit status) to go red, and a root-cause comment to be posted to the PR. With `ANTHROPIC_API_KEY` set, the K=1 auto-fix leg proposes a one-commit app-code fix and re-verifies; it moves the gate to amber "fix ready, human merge required" and never auto-merges.
+5. Expect the `season-persistence` journey to **FAIL** (the status is lost on reload), the merge gate (`kane/guardian` commit status) to go red, and a root-cause comment to be posted to the PR. With `CLAUDE_CODE_OAUTH_TOKEN` set, the K=1 auto-fix leg proposes a one-commit app-code fix and re-verifies; it moves the gate to amber "fix ready, human merge required" and never auto-merges.
 
 To see a clean pass instead, run the same workflow with `pr_ref` set to your default branch (no seeded bug), and every journey should return PASS.
 
@@ -92,7 +92,7 @@ All five are safe to trigger manually from the **Actions** tab with **Run workfl
   ```
 
 ### Flagship 5: PR Quality Gate Agent
-- **Actions tab:** Run workflow, set `pr_ref` to `demo/seeded-bug` (or any branch). This is the diff-aware, cache-and-replay sibling of the hero: it classifies the diff into the 1 to 3 journeys it can break (with `ANTHROPIC_API_KEY`) and aggregates them into a single `Kane Quality Gate` commit status. It posts a root-cause PR review comment on fail. It has no auto-fix and no bot commit. To make it a true gate, add `Kane Quality Gate` as a required status check in branch protection.
+- **Actions tab:** Run workflow, set `pr_ref` to `demo/seeded-bug` (or any branch). This is the diff-aware, cache-and-replay sibling of the hero: it classifies the diff into the 1 to 3 journeys it can break (with `CLAUDE_CODE_OAUTH_TOKEN`) and aggregates them into a single `Kane Quality Gate` commit status. It posts a root-cause PR review comment on fail. It has no auto-fix and no bot commit. To make it a true gate, add `Kane Quality Gate` as a required status check in branch protection.
 - No `repository_dispatch`; the production trigger is `pull_request`.
 
 ### Flagship 6: Self-Healing Release Train
@@ -109,6 +109,6 @@ Replace `:owner/:repo` with your repository, or let `gh` infer it inside the rep
 
 ## 4. Costs and what does not happen on its own
 
-Each Kane journey run consumes Kane credits, roughly 3 to 35 credits depending on how much the agent has to explore, plus a couple of minutes of wall time. The Claude legs (selection in F1 and F5, the K=1 fix in F1 and F6) consume Anthropic tokens on top of that, only when `ANTHROPIC_API_KEY` is set. Multi-journey workflows multiply by the number of journeys: F3 runs its journey three times (best-of-3), and F5 runs all three committed journeys, so budget those accordingly. In production the first run authors a `_test.md` per journey and later runs replay it deterministically (`kane-cli testmd run`), which is near free; the authoring pass is what costs.
+Each Kane journey run consumes Kane credits, roughly 3 to 35 credits depending on how much the agent has to explore, plus a couple of minutes of wall time. The Claude legs (selection in F1 and F5, the K=1 fix in F1 and F6) consume Anthropic tokens on top of that, only when `CLAUDE_CODE_OAUTH_TOKEN` is set. Multi-journey workflows multiply by the number of journeys: F3 runs its journey three times (best-of-3), and F5 runs all three committed journeys, so budget those accordingly. In production the first run authors a `_test.md` per journey and later runs replay it deterministically (`kane-cli testmd run`), which is near free; the authoring pass is what costs.
 
 Nothing in this set fires automatically while the production triggers stay commented out, and nothing ever auto-merges or auto-publishes. The auto-fix in F1 and F6 is capped at K=1, edits app code only (never the test), and only moves a gate to amber "fix ready, human merge required". A human owns every merge, every Jira transition past creation, and every release. The seeded-bug demo only touches the `demo/seeded-bug` branch and never your default branch.
