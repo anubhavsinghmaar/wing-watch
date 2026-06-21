@@ -18,6 +18,10 @@ on:
         description: "PR head ref / branch to guard (e.g. a seeded-bug branch)"
         required: true
         default: "demo/seeded-bug"
+      pr_number:
+        description: "PR number to post the root cause comment on (optional)"
+        required: false
+        default: ""
   # PRODUCTION TRIGGER (uncomment once secrets are set):
   # pull_request:
   #   types: [opened, synchronize, reopened]
@@ -92,10 +96,11 @@ jobs:
 
       # 4. On failure: root cause IN the PR (the gap our own GitHub App has)
       - name: Post root cause to the PR
-        if: ${{ steps.gate.outputs.fail == '1' && github.event.pull_request.number != '' }}
+        if: ${{ steps.gate.outputs.fail == '1' && (github.event.inputs.pr_number != '' || github.event.pull_request.number != '') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
         run: |
           BODY=$(cat <<EOF
           ### KaneAI Guardian — verdict: FAILED
@@ -108,7 +113,7 @@ jobs:
           Evidence: Kane run dirs (screenshots/network/console) attached as workflow artifacts; Test Manager: ${{ steps.j_season.outputs.test_url }}
           EOF
           )
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY" || true
+          gh pr comment "$PR" --body "$BODY" || true
 
       # 5. Auto-fix (K=1, gated on Claude, human still merges). Disabled unless
       #    CLAUDE_CODE_OAUTH_TOKEN is set; only proposes, never auto-merges.
