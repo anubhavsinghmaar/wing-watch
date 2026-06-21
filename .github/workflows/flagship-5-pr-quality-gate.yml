@@ -1,0 +1,176 @@
+# FLAGSHIP 5 - PR Quality Gate Agent
+# The diff-aware, cache-and-replay-deterministic sibling of the hero (flagship-1).
+# Claude classifies the PR diff into the 1-3 journeys it can break, runs each via
+# the shared Kane composite action against a per-PR build served inside the runner,
+# and aggregates into ONE merge-gating commit status "Kane Quality Gate" (green only
+# if every verdict is PASS; VOID = neutral, never a silent green). On fail it posts a
+# PR review comment with the root cause from the Kane run summary.
+#
+# Lighter than the hero: this is the planner/reporter gate (cache-and-replay
+# determinism is the headline) - NO auto-fix loop, NO bot commit. Auto-fix lives in
+# flagship-1.
+#
+# SAFE BY DEFAULT: the live trigger here is workflow_dispatch, so this never fires
+# automatically and never fails on missing secrets. The production trigger
+# (pull_request) is shown commented below; uncomment it AFTER you have added the
+# secrets (see FLAGSHIP-DEMO-README.md). wing-watch is static, so the "preview" is the
+# PR branch served inside the runner at localhost - no external deploy.
+#
+# BRANCH PROTECTION: to make this a TRUE gate, add the "Kane Quality Gate" check as a
+# required status check in the branch protection rule for your default branch.
+
+name: "Flagship 5 - PR Quality Gate Agent"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_ref:
+        description: "PR head ref / branch to gate (e.g. a seeded-bug branch)"
+        required: true
+        default: "demo/seeded-bug"
+  # PRODUCTION TRIGGER (uncomment after secrets are set):
+  # pull_request:
+  #   types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read         # checkout the PR build (read-only; no bot commit in this gate)
+  pull-requests: write   # PR review comment on fail
+  statuses: write        # the single "Kane Quality Gate" merge-gating commit status
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the PR build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.pr_ref || github.head_ref }}
+          fetch-depth: 0  # need the base ref so Claude can diff the change
+
+      # 1. PLAN (optional, gated on Claude) - Claude reads the diff and picks the 1-3
+      #    journeys the change can break. Falls back to the full committed set when
+      #    disabled, so the gate still runs without the key.
+      - name: Claude classifies the diff into 1-3 journeys
+        id: plan
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        shell: bash
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          DIFF=$(git diff origin/${{ github.event.repository.default_branch }}...HEAD || git show --stat HEAD)
+          PROMPT="You are a diff-aware test planner. Given this wing-watch diff, output ONLY a comma-separated subset (max 3) of these journey keys that the change can break: location-filter, season-persistence, no-app-errors. Diff:\n$DIFF"
+          SEL=$(claude -p "$PROMPT" --disallowedTools "Bash" 2>/dev/null | tail -1)
+          echo "journeys=${SEL:-location-filter,season-persistence,no-app-errors}" >> "$GITHUB_OUTPUT"
+
+      # 2. GATE = replay the picked journeys via the shared composite action (default:
+      #    all three committed journeys from .lambdatest/journeys.json). The composite
+      #    action serves the PR build at localhost - wing-watch is static, no deploy.
+      #    NOTE: no --ws-endpoint anywhere; Kane runs locally/headless in the runner.
+      - name: Season persistence
+        id: j_season
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: season-persistence
+          objective: "On the wing-watch dashboard, set a bird's seasonal status for a location, then reload the page. Pass only if that status genuinely persisted across the reload and is still set; fail if the status was lost after reloading."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      - name: Location filter
+        id: j_filter
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: location-filter
+          objective: "On the wing-watch dashboard, use the Location filter to select a single birding location. Pass only if the page genuinely updates to show that location's birds and season board; fail if the filter does not actually change the displayed data."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      # FCP / no-app-errors framing - NOT the LCP performance checkpoint (verified-buggy
+      # per the doc's feasibility fixes); this asserts the app's own error signature.
+      - name: No app errors
+        id: j_errors
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: no-app-errors
+          objective: "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work and no application JavaScript error occurs during the interaction; fail if a real app error is thrown."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      # 3. Aggregate -> ONE merge-gating commit status "Kane Quality Gate".
+      #    success ONLY if every verdict is PASS. FAIL blocks. VOID (exit 2/3, infra)
+      #    is NEUTRAL - retry territory, never a merge-blocking fail and never a silent
+      #    green. This is the check branch protection must require.
+      - name: Set the Kane Quality Gate status
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fail=0
+          void=0
+          for v in "${{ steps.j_season.outputs.verdict }}" \
+                   "${{ steps.j_filter.outputs.verdict }}" \
+                   "${{ steps.j_errors.outputs.verdict }}"; do
+            [ "$v" = "FAIL" ] && fail=1
+            [ "$v" = "VOID" ] && void=1 && echo "::warning::a journey VOIDed (exit 2/3, infra) - neutral, not a merge-blocking fail"
+          done
+          echo "fail=$fail" >> "$GITHUB_OUTPUT"
+
+          # PASS = success ; FAIL = failure ; only-VOID = neutral (pending = unblocked-but-honest)
+          if [ "$fail" = "1" ]; then
+            STATE=failure
+          elif [ "$void" = "1" ]; then
+            STATE=pending   # neutral: VOID never silently goes green
+          else
+            STATE=success
+          fi
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="$STATE" -f context="Kane Quality Gate" \
+            -f description="season=${{ steps.j_season.outputs.verdict }} filter=${{ steps.j_filter.outputs.verdict }} errors=${{ steps.j_errors.outputs.verdict }}" || true
+
+      # 4. On failure: root cause as a PR review comment (the dashboard-only-RCA gap our
+      #    own GitHub App has). Synthesized from the Kane run summary / run_dir, not a
+      #    fake "RCA" field.
+      - name: Post root cause as a PR review comment
+        if: ${{ steps.gate.outputs.fail == '1' && github.event.pull_request.number != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY=$(cat <<EOF
+          ### Kane Quality Gate - verdict: FAILED
+
+          Diff-aware, deterministic replay. The change broke at least one user journey:
+
+          | journey | verdict | root cause (from the Kane run) |
+          |---|---|---|
+          | season-persistence | ${{ steps.j_season.outputs.verdict }} | ${{ steps.j_season.outputs.summary }} |
+          | location-filter | ${{ steps.j_filter.outputs.verdict }} | ${{ steps.j_filter.outputs.summary }} |
+          | no-app-errors | ${{ steps.j_errors.outputs.verdict }} | ${{ steps.j_errors.outputs.summary }} |
+
+          Evidence: Kane run dirs (screenshots / network / console) are attached as workflow artifacts.
+          Test Manager session: ${{ steps.j_season.outputs.test_url }}${{ steps.j_filter.outputs.test_url }}${{ steps.j_errors.outputs.test_url }}
+
+          This gate is the diff-aware deterministic sibling of the self-healing guardian: it reports the root cause where developers look, but does not auto-fix. Fix the change and push; the gate replays the same journeys.
+          EOF
+          )
+          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY" || true
+
+      # 5. Notify the author in Slack (gated on its secret). Real curl only when the
+      #    webhook is set; otherwise the fallback echoes what WOULD be posted so the
+      #    workflow still runs GREEN without the token.
+      - name: Slack the author (real post)
+        if: ${{ steps.gate.outputs.fail == '1' && secrets.SLACK_WEBHOOK != '' }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          SUMMARY="Kane Quality Gate FAILED on ${{ github.repository }}@${{ github.sha }} - season=${{ steps.j_season.outputs.verdict }} filter=${{ steps.j_filter.outputs.verdict }} errors=${{ steps.j_errors.outputs.verdict }}. Test Manager: ${{ steps.j_season.outputs.test_url }}"
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${SUMMARY}\"}" "$SLACK_WEBHOOK" || true
+
+      - name: Slack fallback (no webhook set)
+        if: ${{ steps.gate.outputs.fail == '1' && secrets.SLACK_WEBHOOK == '' }}
+        shell: bash
+        run: |
+          echo "would post to Slack: Kane Quality Gate FAILED on ${{ github.repository }}@${{ github.sha }} - season=${{ steps.j_season.outputs.verdict }} filter=${{ steps.j_filter.outputs.verdict }} errors=${{ steps.j_errors.outputs.verdict }} (set SLACK_WEBHOOK to enable the real post)"

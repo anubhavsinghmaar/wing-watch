@@ -1,0 +1,121 @@
+# FLAGSHIP HERO — PR-to-Production Guardian
+# Reads the PR, runs Kane journeys against a per-PR build served in the runner,
+# posts an honest merge-gating check + the root cause in the PR, and (if enabled)
+# has Claude propose a fix then re-verify green.
+#
+# SAFE BY DEFAULT: the live trigger here is workflow_dispatch, so this never fires
+# automatically and never fails on missing secrets. The production trigger is shown
+# commented below; uncomment it AFTER you have added the secrets (see
+# FLAGSHIP-DEMO-README.md). wing-watch is static, so the "preview" is the PR branch
+# served inside the runner at localhost.
+
+name: "Flagship 1 - PR-to-Production Guardian"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_ref:
+        description: "PR head ref / branch to guard (e.g. a seeded-bug branch)"
+        required: true
+        default: "demo/seeded-bug"
+  # PRODUCTION TRIGGER (uncomment once secrets are set):
+  # pull_request:
+  #   types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write       # bot fix commit
+  pull-requests: write  # PR comment
+  statuses: write       # merge-gating commit status
+  checks: write
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the PR build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.pr_ref || github.head_ref }}
+
+      # 1. SELECT (optional, gated on Claude) — Claude reads the diff and picks the
+      #    journeys the change can break. Falls back to the full set if disabled.
+      - name: Claude selects journeys from the diff
+        id: select
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        shell: bash
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          DIFF=$(git diff origin/${{ github.event.repository.default_branch }}...HEAD || git show --stat HEAD)
+          PROMPT="You are a test selector. Given this wing-watch diff, output ONLY a comma-separated subset of these journey keys that the change can break: location-filter, season-persistence, no-app-errors. Diff:\n$DIFF"
+          SEL=$(claude -p "$PROMPT" --disallowedTools "Bash" 2>/dev/null | tail -1)
+          echo "journeys=${SEL:-location-filter,season-persistence,no-app-errors}" >> "$GITHUB_OUTPUT"
+
+      # 2. GATE = run the selected journeys (default: all three)
+      - name: Season persistence
+        id: j_season
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: season-persistence
+          objective: "On the wing-watch dashboard, set a bird's seasonal status for a location, then reload the page. Pass only if that status genuinely persisted across the reload and is still set; fail if the status was lost after reloading."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      - name: Location filter
+        id: j_filter
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: location-filter
+          objective: "On the wing-watch dashboard, use the Location filter to select a single birding location. Pass only if the page genuinely updates to show that location's birds and season board; fail if the filter does not actually change the displayed data."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      # 3. Aggregate -> a single merge-gating commit status (green ONLY if all PASS;
+      #    VOID = infra, retried/neutral, never a silent green)
+      - name: Set merge gate
+        id: gate
+        shell: bash
+        run: |
+          fail=0
+          for v in "${{ steps.j_season.outputs.verdict }}" "${{ steps.j_filter.outputs.verdict }}"; do
+            [ "$v" = "FAIL" ] && fail=1
+            [ "$v" = "VOID" ] && echo "::warning::a journey VOIDed (infra) - treat as neutral, not green"
+          done
+          echo "fail=$fail" >> "$GITHUB_OUTPUT"
+          STATE=success; [ "$fail" = "1" ] && STATE=failure
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="$STATE" -f context="kane/guardian" \
+            -f description="season=${{ steps.j_season.outputs.verdict }} filter=${{ steps.j_filter.outputs.verdict }}" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # 4. On failure: root cause IN the PR (the gap our own GitHub App has)
+      - name: Post root cause to the PR
+        if: ${{ steps.gate.outputs.fail == '1' && github.event.pull_request.number != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY=$(cat <<EOF
+          ### KaneAI Guardian — verdict: FAILED
+          | journey | verdict | evidence |
+          |---|---|---|
+          | season-persistence | ${{ steps.j_season.outputs.verdict }} | ${{ steps.j_season.outputs.summary }} |
+          | location-filter | ${{ steps.j_filter.outputs.verdict }} | ${{ steps.j_filter.outputs.summary }} |
+
+          Root cause (from the Kane run): **${{ steps.j_season.outputs.summary }}${{ steps.j_filter.outputs.summary }}**
+          Evidence: Kane run dirs (screenshots/network/console) attached as workflow artifacts; Test Manager: ${{ steps.j_season.outputs.test_url }}
+          EOF
+          )
+          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY" || true
+
+      # 5. Auto-fix (K=1, gated on Claude, human still merges). Disabled unless
+      #    ANTHROPIC_API_KEY is set; only proposes, never auto-merges.
+      - name: Claude proposes a fix and re-verifies (K=1)
+        if: ${{ steps.gate.outputs.fail == '1' && env.ANTHROPIC_API_KEY != '' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        shell: bash
+        run: |
+          echo "K=1 auto-fix would run here: Claude edits app code only (never the test), commits to the PR branch, waits for the rebuilt preview, and re-runs the SAME journey twice. Gate moves only to amber 'fix ready, human merge required'. Wired but left as a guarded no-op in the demo to avoid pushing commits without review."

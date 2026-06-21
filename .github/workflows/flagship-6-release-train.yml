@@ -1,0 +1,302 @@
+# FLAGSHIP 6 — Self-Healing Release Train
+# A tag-gated release pipeline. On a release tag it (1) checks Datadog deploy/RUM
+# health as a pre-gate guard (env already broken => INCONCLUSIVE, no false blame),
+# (2) runs the diff-scoped Kane regression journey against the PR/tag build served
+# in the runner, (3) on FAIL extracts evidence, files a gated Jira bug, opens a
+# guarded fix-branch PR (note only — never auto-merge), then RE-RUNS the same
+# journey to prove green, and (4) moves the gate only to AMBER "regression fixed in
+# PR, human merge required" on green, or RED on still-failing.
+#
+# SAFE BY DEFAULT: the live trigger is workflow_dispatch, so this never fires
+# automatically and never fails on missing secrets. Every external-system leg
+# (Datadog / Jira / Slack) is gated on its secret and falls back to an echo so the
+# workflow runs GREEN with no tokens. The production trigger (push tags) is shown
+# commented below; uncomment it AFTER you have added the secrets (see
+# FLAGSHIP-DEMO-README.md). wing-watch is static, so the "release build" is the
+# tagged ref served inside the runner at localhost — no external deploy.
+#
+# Feasibility rules baked in (per Kane_CLI_Cookbook_Flagship_UseCases.md):
+#   - NO --ws-endpoint. Kane runs locally/headless via the composite action.
+#     Real-device / cross-browser breadth is reached ONLY via the real path:
+#     Test Manager upload -> HyperExecute (/api/atm/v1/hyperexecute), never a flag.
+#   - exit 2/3 (VOID) = infra/neutral, retry — NEVER a merge-blocking fail.
+#   - No LCP performance checkpoint; behavioral framing via the no-app-errors / FCP
+#     journey only.
+#   - Auto-fix capped at K=1 and HUMAN-merge-only (amber gate). Never auto-merge,
+#     never auto-publish a GitHub Release.
+#   - Controlled target only: the served runner build of the tagged ref.
+
+name: "Flagship 6 - Self-Healing Release Train"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag / ref to gate (e.g. v1.4.0 or a seeded-bug ref)"
+        required: true
+        default: "demo/seeded-bug"
+  # Incident/alarm-triggered variant carries a synthetic payload input so nothing
+  # real has to fire. Uncomment after secrets are set.
+  # repository_dispatch:
+  #   types: [release-train]
+  # PRODUCTION TRIGGER (uncomment once secrets are set):
+  # push:
+  #   tags:
+  #     - "v*"
+
+# Least privilege: read code, open the guarded fix-branch PR, write the release
+# commit status. No release-publish / no admin scopes — human owns merge + publish.
+permissions:
+  contents: write       # create the guarded fix branch
+  pull-requests: write  # open the fix PR (note only, never merged here)
+  statuses: write       # release-gate commit status
+
+jobs:
+  release-train:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the tagged release build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.event.client_payload.tag || github.ref_name }}
+          fetch-depth: 0
+
+      # 1. PRE-GATE GUARD (gated on Datadog) — is the env already unhealthy?
+      #    If DATADOG_API_KEY is set we check the deploy marker + RUM error rate +
+      #    key synthetic; if it reads unhealthy we mark the run INCONCLUSIVE and
+      #    stop (no false blame on the release). With no token we skip and continue.
+      - name: Datadog pre-gate health guard
+        id: pregate
+        shell: bash
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+        run: |
+          if [ -z "$DATADOG_API_KEY" ]; then
+            echo "skipping pre-gate, no Datadog token"
+            echo "health=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Read-only health read: deploy/RUM error rate over the last 15m.
+          HEALTH=$(curl -sf -G "https://api.datadoghq.com/api/v1/query" \
+            -H "DD-API-KEY: $DATADOG_API_KEY" \
+            -H "DD-APPLICATION-KEY: $DATADOG_APP_KEY" \
+            --data-urlencode "from=$(( $(date +%s) - 900 ))" \
+            --data-urlencode "to=$(date +%s)" \
+            --data-urlencode 'query=sum:rum.errors{service:wing-watch}.as_count()' \
+            | jq -r 'try (.series[0].pointlist | map(.[1]) | add // 0) catch 0' )
+          HEALTH=${HEALTH:-0}
+          echo "Datadog RUM error count (15m): $HEALTH"
+          # Threshold is illustrative; tune per service SLO.
+          if awk "BEGIN{exit !($HEALTH > 25)}"; then
+            echo "::warning::env already unhealthy (RUM errors=$HEALTH) - marking run INCONCLUSIVE"
+            echo "health=unhealthy" >> "$GITHUB_OUTPUT"
+          else
+            echo "health=healthy" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Env already broken => INCONCLUSIVE, stop here. Not a release failure, so the
+      # commit status is neutral (no false blame) and no ticket is filed.
+      - name: Mark INCONCLUSIVE and stop (env already unhealthy)
+        if: ${{ steps.pregate.outputs.health == 'unhealthy' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="error" -f context="kane/release-train" \
+            -f description="INCONCLUSIVE: env already unhealthy at release time (pre-gate)" || true
+          echo "Pre-gate guard: environment already unhealthy. Stopping without blaming the release."
+          exit 0
+
+      # 2. GATE = run the diff-scoped Kane regression journey via the composite
+      #    action. wing-watch is static: the action serves the tagged build in the
+      #    runner at localhost (NO external deploy, NO --ws-endpoint). Breadth
+      #    (real-device / cross-browser) is reached the real way — Test Manager
+      #    upload -> HyperExecute /api/atm/v1/hyperexecute — handled downstream of
+      #    the green gate, not here.
+      - name: Regression journey (no-app-errors)
+        id: j_regression
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: no-app-errors
+          objective: "Open the wing-watch dashboard and exercise the Location filter and the season board across a release-representative path. Pass only if the app's own features genuinely work and no application JavaScript error occurs during the interaction (FCP/behavioral framing, not LCP); fail if a real app error is thrown or a core interaction is broken."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      # 3. Classify the verdict. exit 2/3 (VOID) is infra — neutral/retry, NEVER a
+      #    merge-blocking fail. Only a true FAIL drives the self-heal loop.
+      - name: Classify regression verdict
+        id: verdict
+        shell: bash
+        run: |
+          V="${{ steps.j_regression.outputs.verdict }}"
+          echo "verdict=$V"
+          if [ "$V" = "VOID" ]; then
+            echo "::warning::regression journey VOIDed (infra, exit 2/3) - neutral, not a release fail"
+            echo "outcome=void" >> "$GITHUB_OUTPUT"
+          elif [ "$V" = "FAIL" ]; then
+            echo "outcome=fail" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=pass" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 3a. Extract structured evidence from the Kane run_dir (broken locator,
+      #     failing checkpoint, screenshot/console) for the ticket + PR note.
+      - name: Extract evidence from run_dir (on FAIL)
+        id: evidence
+        if: ${{ steps.verdict.outputs.outcome == 'fail' }}
+        shell: bash
+        run: |
+          {
+            echo "Release: ${{ github.event.inputs.tag || github.event.client_payload.tag || github.ref_name }}"
+            echo "Journey: no-app-errors (verdict=${{ steps.j_regression.outputs.verdict }}, exit=${{ steps.j_regression.outputs.exit_code }})"
+            echo "Root cause (synthesized from run_end.reason / one_liner): ${{ steps.j_regression.outputs.summary }}"
+            echo "Run dir (screenshots/network/console): ${{ steps.j_regression.outputs.run_dir }}"
+            echo "Test Manager session: ${{ steps.j_regression.outputs.test_url }}"
+            echo "Credits: ${{ steps.j_regression.outputs.credits }}"
+          } > /tmp/evidence.txt
+          cat /tmp/evidence.txt
+          # Expose a one-line summary for downstream steps.
+          {
+            echo "rootcause=${{ steps.j_regression.outputs.summary }}"
+            echo "test_url=${{ steps.j_regression.outputs.test_url }}"
+          } >> "$GITHUB_OUTPUT"
+
+      # 3b. File a Jira bug (gated on Jira secrets). Real REST create when the token
+      #     exists; otherwise echo "would create" so the run stays green.
+      - name: File Jira bug (on FAIL)
+        id: jira
+        if: ${{ steps.verdict.outputs.outcome == 'fail' }}
+        shell: bash
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+          SUMMARY: "Release regression: ${{ steps.j_regression.outputs.summary }}"
+        run: |
+          if [ -z "${JIRA_API_TOKEN}" ]; then
+            echo "would create Jira bug: $SUMMARY"
+            echo "(evidence: $(cat /tmp/evidence.txt | tr '\n' ' '))"
+            echo "issue_key=DEMO-0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BODY=$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" \
+            --arg d "$(cat /tmp/evidence.txt)" \
+            '{fields:{project:{key:$p},summary:$s,description:$d,issuetype:{name:"Bug"}}}')
+          KEY=$(curl -sf -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Content-Type: application/json" -d "$BODY" | jq -r '.key // "DEMO-0"')
+          echo "Filed Jira bug: $KEY"
+          echo "issue_key=$KEY" >> "$GITHUB_OUTPUT"
+
+      # 3c. Open a GUARDED fix-branch PR — low-risk only (restore a removed
+      #     data-testid, revert a string, fix a contract typo). NOTE ONLY: the PR
+      #     is opened for human review and is NEVER auto-merged here (K=1 boundary).
+      #     Gated on Anthropic so the actual code repair is opt-in; otherwise the
+      #     step is a guarded no-op that explains what it would do.
+      - name: Open guarded fix-branch PR (K=1, on FAIL, never auto-merge)
+        id: fixpr
+        if: ${{ steps.verdict.outputs.outcome == 'fail' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "would open guarded fix-branch PR (K=1, human-merge-only):"
+            echo "  - Claude edits APP code only (never the test), low-risk fix"
+            echo "  - branch fix/release-${{ github.run_id }} -> PR referencing Jira ${{ steps.jira.outputs.issue_key }}"
+            echo "  - PR is a NOTE for human review; this workflow never merges it"
+            echo "branch=fix/release-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          npm install -g @anthropic-ai/claude-code
+          BRANCH="fix/release-${{ github.run_id }}"
+          git config user.name "kane-release-train[bot]"
+          git config user.email "kane-release-train@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          PROMPT="You are a release-repair agent. Read /tmp/evidence.txt for the failing wing-watch regression. Apply the SMALLEST low-risk fix to APP code ONLY (restore a removed data-testid, revert a string, fix a contract typo). NEVER edit any test or journey file. If no safe one-commit fix exists, make no change."
+          claude -p "$PROMPT" --disallowedTools "Bash" 2>/dev/null || true
+          if git diff --quiet; then
+            echo "No safe K=1 fix found; leaving gate red for human triage."
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -am "fix: candidate repair for release regression (Jira ${{ steps.jira.outputs.issue_key }})"
+          git push origin "$BRANCH"
+          gh pr create --head "$BRANCH" --base "${{ github.event.repository.default_branch }}" \
+            --title "Candidate fix: release regression (${{ steps.jira.outputs.issue_key }})" \
+            --body "Automated K=1 candidate fix. NOTE ONLY — human merge required. Jira: ${{ steps.jira.outputs.issue_key }}. Evidence: ${{ steps.j_regression.outputs.test_url }}" || true
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # 3d. PROVE-GREEN — re-run the SAME journey to confirm the fix actually holds.
+      #     (In the no-token demo path nothing was changed, so this honestly
+      #     re-verifies the current build rather than pretending a fix landed.)
+      - name: Re-run the same journey to prove green (on FAIL)
+        id: reverify
+        if: ${{ steps.verdict.outputs.outcome == 'fail' }}
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: no-app-errors-reverify
+          objective: "Re-run the release regression check on the wing-watch dashboard: exercise the Location filter and the season board. Pass only if the app's own features genuinely work and no application JavaScript error occurs (FCP/behavioral framing); fail if the regression is still present."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      # 4. GATE DECISION
+      #    - PASS first time      -> success (release gate green)
+      #    - VOID                 -> neutral/error (infra, never a blocking fail)
+      #    - FAIL then re-verify PASS -> AMBER "regression fixed in PR, human merge required"
+      #    - FAIL then still FAIL -> RED (blocking)
+      #    Never auto-merge / never auto-publish.
+      - name: Set release gate
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OUTCOME="${{ steps.verdict.outputs.outcome }}"
+          REVERIFY="${{ steps.reverify.outputs.verdict }}"
+          STATE="success"; DESC="release verified green"
+          if [ "$OUTCOME" = "void" ]; then
+            STATE="error"; DESC="VOID (infra) - neutral, re-run; not a release fail"
+          elif [ "$OUTCOME" = "fail" ]; then
+            if [ "$REVERIFY" = "PASS" ]; then
+              # AMBER: GitHub statuses have no amber; encode as success with an
+              # explicit human-merge-required description so the gate is honest.
+              STATE="success"
+              DESC="AMBER: regression fixed in PR ${{ steps.fixpr.outputs.branch }}, human merge required"
+            else
+              STATE="failure"
+              DESC="RED: regression still failing (reverify=${REVERIFY:-none}); human triage"
+            fi
+          fi
+          echo "gate state=$STATE :: $DESC"
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="$STATE" -f context="kane/release-train" \
+            -f description="$DESC" || true
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "desc=$DESC" >> "$GITHUB_OUTPUT"
+
+      # 5. Notify (gated on Slack webhook) — real curl when set, else echo the
+      #    summary so the workflow runs green without the token.
+      - name: Notify Slack
+        if: always()
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          SUMMARY="Release train ${{ github.event.inputs.tag || github.event.client_payload.tag || github.ref_name }}: ${{ steps.gate.outputs.desc }} (pre-gate=${{ steps.pregate.outputs.health }}, verdict=${{ steps.j_regression.outputs.verdict }}). Evidence: ${{ steps.j_regression.outputs.test_url }}"
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            curl -sf -X POST -H 'Content-type: application/json' \
+              --data "$(jq -n --arg t "$SUMMARY" '{text:$t}')" "$SLACK_WEBHOOK" || true
+          else
+            echo "would post: $SUMMARY"
+          fi
+
+      # NOTE: real-device / cross-browser breadth on green is reached the real way —
+      # Test Manager auto-upload fans the journey onto the HyperExecute matrix
+      # (/api/atm/v1/hyperexecute), NOT via --ws-endpoint. Left as a documented,
+      # post-green step. This workflow never auto-merges the fix PR and never
+      # auto-publishes a GitHub Release — a human owns both.
