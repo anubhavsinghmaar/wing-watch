@@ -40,6 +40,8 @@ permissions:
 jobs:
   quality-gate:
     runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
     steps:
       - name: Checkout the PR build
         uses: actions/checkout@v4
@@ -160,7 +162,7 @@ jobs:
       #    webhook is set; otherwise the fallback echoes what WOULD be posted so the
       #    workflow still runs GREEN without the token.
       - name: Slack the author (real post)
-        if: ${{ steps.gate.outputs.fail == '1' && secrets.SLACK_WEBHOOK != '' }}
+        if: ${{ steps.gate.outputs.fail == '1' && env.SLACK_WEBHOOK != '' }}
         shell: bash
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
@@ -170,7 +172,7 @@ jobs:
             --data "{\"text\":\"${SUMMARY}\"}" "$SLACK_WEBHOOK" || true
 
       - name: Slack fallback (no webhook set)
-        if: ${{ steps.gate.outputs.fail == '1' && secrets.SLACK_WEBHOOK == '' }}
+        if: ${{ steps.gate.outputs.fail == '1' && env.SLACK_WEBHOOK == '' }}
         shell: bash
         run: |
           echo "would post to Slack: Kane Quality Gate FAILED on ${{ github.repository }}@${{ github.sha }} - season=${{ steps.j_season.outputs.verdict }} filter=${{ steps.j_filter.outputs.verdict }} errors=${{ steps.j_errors.outputs.verdict }} (set SLACK_WEBHOOK to enable the real post)"

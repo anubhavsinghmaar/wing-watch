@@ -53,6 +53,13 @@ permissions:
 jobs:
   reproduce:
     runs-on: ubuntu-latest
+    env:
+      DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+      DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
     steps:
       # 0. Normalise the alarm payload from whichever trigger fired. The
       #    repository_dispatch path carries a synthetic client_payload in the demo;
@@ -77,7 +84,7 @@ jobs:
       #    create a Datadog incident here. Falls back to the payload as-is.
       - name: Read the alarm context from Datadog
         id: datadog
-        if: ${{ secrets.DATADOG_API_KEY != '' && secrets.DATADOG_APP_KEY != '' }}
+        if: ${{ env.DATADOG_API_KEY != '' && env.DATADOG_APP_KEY != '' }}
         shell: bash
         env:
           DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
@@ -90,7 +97,7 @@ jobs:
 
       - name: Datadog read fallback (no token)
         id: datadog_fallback
-        if: ${{ secrets.DATADOG_API_KEY == '' || secrets.DATADOG_APP_KEY == '' }}
+        if: ${{ env.DATADOG_API_KEY == '' || env.DATADOG_APP_KEY == '' }}
         shell: bash
         run: |
           echo "would read from Datadog: alarm route=${{ steps.alarm.outputs.url }} signature='${{ steps.alarm.outputs.signature }}' (no DATADOG_API_KEY/DATADOG_APP_KEY set, using payload as-is)"
@@ -145,7 +152,7 @@ jobs:
       # 4a. FILE (real reproduction only) — gated Jira bug. The bug carries the
       #     run_dir + test_url so the branch decision (bifurcation.log) is auditable.
       - name: File a Jira bug (reproduced only)
-        if: ${{ steps.decide.outputs.outcome == 'reproduced' && secrets.JIRA_BASE_URL != '' && secrets.JIRA_EMAIL != '' && secrets.JIRA_API_TOKEN != '' }}
+        if: ${{ steps.decide.outputs.outcome == 'reproduced' && env.JIRA_BASE_URL != '' && env.JIRA_EMAIL != '' && env.JIRA_API_TOKEN != '' }}
         shell: bash
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -163,7 +170,7 @@ jobs:
             && echo "Jira bug filed." || echo "::warning::Jira create failed (left non-fatal)"
 
       - name: Jira fallback (reproduced, no token)
-        if: ${{ steps.decide.outputs.outcome == 'reproduced' && (secrets.JIRA_BASE_URL == '' || secrets.JIRA_EMAIL == '' || secrets.JIRA_API_TOKEN == '') }}
+        if: ${{ steps.decide.outputs.outcome == 'reproduced' && (env.JIRA_BASE_URL == '' || env.JIRA_EMAIL == '' || env.JIRA_API_TOKEN == '') }}
         shell: bash
         run: |
           echo "would file Jira bug: [Kane] Alarm reproduced outside-in: ${{ steps.alarm.outputs.signature }}"
@@ -174,7 +181,7 @@ jobs:
       #     a ticket. Framed as "did not reproduce outside-in," never a definitive
       #     all-clear.
       - name: Post "did not reproduce outside-in"
-        if: ${{ steps.decide.outputs.outcome == 'not_reproduced' && secrets.SLACK_WEBHOOK != '' }}
+        if: ${{ steps.decide.outputs.outcome == 'not_reproduced' && env.SLACK_WEBHOOK != '' }}
         shell: bash
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
@@ -185,7 +192,7 @@ jobs:
             && echo "Posted all-clear to Slack." || echo "::warning::Slack post failed (left non-fatal)"
 
       - name: All-clear fallback (no Slack token)
-        if: ${{ steps.decide.outputs.outcome == 'not_reproduced' && secrets.SLACK_WEBHOOK == '' }}
+        if: ${{ steps.decide.outputs.outcome == 'not_reproduced' && env.SLACK_WEBHOOK == '' }}
         shell: bash
         run: |
           echo "would post: did not reproduce outside-in — alarm '${{ steps.alarm.outputs.signature }}' (Kane verdict PASS); no bug filed; evidence ${{ steps.repro.outputs.test_url }}"
@@ -193,7 +200,7 @@ jobs:
       # 5. Always notify the incident channel with the verdict + branch + credits +
       #    links (gated on Slack; fallback echoes). VOID is reported as neutral.
       - name: Notify incident channel
-        if: ${{ always() && secrets.SLACK_WEBHOOK != '' }}
+        if: ${{ always() && env.SLACK_WEBHOOK != '' }}
         shell: bash
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
@@ -203,7 +210,7 @@ jobs:
             -d "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK_WEBHOOK" || echo "::warning::Slack notify failed (left non-fatal)"
 
       - name: Incident-channel fallback (no Slack token)
-        if: ${{ always() && secrets.SLACK_WEBHOOK == '' }}
+        if: ${{ always() && env.SLACK_WEBHOOK == '' }}
         shell: bash
         run: |
           echo "would post: verdict=${{ steps.repro.outputs.verdict }} (exit ${{ steps.repro.outputs.exit_code }}) credits=${{ steps.repro.outputs.credits }} | ${{ steps.repro.outputs.summary }} | run_dir=${{ steps.repro.outputs.run_dir }} | test_url=${{ steps.repro.outputs.test_url }}"

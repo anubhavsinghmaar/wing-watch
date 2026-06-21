@@ -50,6 +50,10 @@ permissions:
 jobs:
   rum-regression:
     runs-on: ubuntu-latest
+    env:
+      DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+      PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
     steps:
       - name: Checkout the build to guard
         uses: actions/checkout@v4
@@ -71,7 +75,7 @@ jobs:
       #    budget from the RUM p75. Without a token this is a documented no-op so the run is green.
       - name: Derive budget from Datadog RUM p75
         id: rum
-        if: ${{ secrets.DATADOG_API_KEY != '' }}
+        if: ${{ env.DATADOG_API_KEY != '' }}
         env:
           DD_API_KEY: ${{ secrets.DATADOG_API_KEY }}
           DD_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
@@ -80,7 +84,7 @@ jobs:
           echo "Would query Datadog RUM: rank '${{ steps.cfg.outputs.journey }}' views by p75 FCP/CLS/INP delta vs 7-day baseline, confirm no synthetic covers this route/device, and emit the p75 FCP as the budget."
           echo "::notice::Datadog RUM read is wired; budget would be the live p75 FCP, not the '${{ steps.cfg.outputs.budget }}' label."
       - name: No Datadog token - use the budget_label as-is
-        if: ${{ secrets.DATADOG_API_KEY == '' }}
+        if: ${{ env.DATADOG_API_KEY == '' }}
         shell: bash
         run: echo "DATADOG_API_KEY not set - using budget_label '${{ steps.cfg.outputs.budget }}' instead of a live RUM p75 (demo-safe, green)."
 
@@ -149,7 +153,7 @@ jobs:
 
       # 5a. PAGE -> Slack (gated on its secret; else echoes "would page" so the run stays green).
       - name: Page Slack on confirmed regression
-        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.SLACK_WEBHOOK != '' }}
+        if: ${{ steps.judge.outputs.confirmed == '1' && env.SLACK_WEBHOOK != '' }}
         shell: bash
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
@@ -159,7 +163,7 @@ jobs:
           curl -sf -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
 
       - name: Slack fallback (no webhook)
-        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.SLACK_WEBHOOK == '' }}
+        if: ${{ steps.judge.outputs.confirmed == '1' && env.SLACK_WEBHOOK == '' }}
         shell: bash
         run: 'echo "would page Slack - CONFIRMED regression on ${{ steps.cfg.outputs.journey }}: ${{ steps.judge.outputs.summary }}"'
 
@@ -167,7 +171,7 @@ jobs:
       #     In production a Datadog incident object, if required, is created out-of-band via
       #     the Incidents REST API (gated on DATADOG_API_KEY), never via the read-only MCP.
       - name: Page PagerDuty on confirmed regression
-        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.PAGERDUTY_ROUTING_KEY != '' }}
+        if: ${{ steps.judge.outputs.confirmed == '1' && env.PAGERDUTY_ROUTING_KEY != '' }}
         shell: bash
         env:
           PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
@@ -178,7 +182,7 @@ jobs:
             --data "$PAYLOAD" "https://events.pagerduty.com/v2/enqueue" || true
 
       - name: PagerDuty fallback (no routing key)
-        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.PAGERDUTY_ROUTING_KEY == '' }}
+        if: ${{ steps.judge.outputs.confirmed == '1' && env.PAGERDUTY_ROUTING_KEY == '' }}
         shell: bash
         run: 'echo "would page PagerDuty - CONFIRMED regression on ${{ steps.cfg.outputs.journey }}: ${{ steps.judge.outputs.summary }}"'
 
