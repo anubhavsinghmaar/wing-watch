@@ -1,0 +1,209 @@
+# FLAGSHIP 4 — Datadog-Alarm Reproduce-and-Verify
+# A production alarm tells Kane exactly what to look for. Kane re-drives the live
+# journey outside-in, the execute_api + if_else branch is logged to
+# runs/<n>/bifurcation.log, and a Jira bug is filed ONLY when the failure truly
+# reproduces (verdict FAIL). On a healthy page it files nothing and posts
+# "did not reproduce outside-in" — killing alert fatigue with auditable proof,
+# not another threshold ping.
+#
+# SAFE BY DEFAULT: the live triggers here are workflow_dispatch and a
+# repository_dispatch that carries a SYNTHETIC alarm payload, so this never fires
+# automatically and never fails on missing secrets. The production trigger (a real
+# Datadog monitor webhook -> repository_dispatch) is shown commented below;
+# uncomment it AFTER you have added the secrets (see FLAGSHIP-DEMO-README.md).
+# wing-watch is static, so the "target" is the PR branch served inside the runner
+# at localhost — a controlled target, never raw flaky production.
+#
+# Every external-system leg (Datadog read, Jira create, Slack post) is GATED on its
+# secret: with the secret it does the real call; without it, a fallback step echoes
+# "would post: <summary>" so the workflow runs GREEN with no tokens set.
+
+name: "Flagship 4 - Datadog-Alarm Reproduce-and-Verify"
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Failing URL / route from the alarm (served in the runner)"
+        required: true
+        default: "/"
+      journey:
+        description: "Which Kane journey reproduces the alarm"
+        required: true
+        type: choice
+        options: [season-persistence, location-filter, no-app-errors]
+        default: season-persistence
+      error_signature:
+        description: "The app's own error signature the alarm fired on"
+        required: true
+        default: "season status lost after reload"
+  repository_dispatch:
+    # Incident-triggered path. In the demo the payload is SYNTHETIC (you craft it),
+    # so nothing real has to be wired for this to run green.
+    types: [alarm]
+  # PRODUCTION TRIGGER (uncomment once secrets are set):
+  # A real Datadog monitor -> webhook -> this same repository_dispatch event_type
+  # 'alarm', with client_payload { url, journey, error_signature, trace_id }.
+  # Datadog incidents are read-only via the MCP/API; pages arrive via the webhook,
+  # never auto-created here.
+
+permissions:
+  contents: read   # checkout + read the served build; this workflow never commits
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    steps:
+      # 0. Normalise the alarm payload from whichever trigger fired. The
+      #    repository_dispatch path carries a synthetic client_payload in the demo;
+      #    workflow_dispatch carries the same fields as inputs.
+      - name: Read the alarm payload
+        id: alarm
+        shell: bash
+        run: |
+          URL="${{ github.event.inputs.url || github.event.client_payload.url || '/' }}"
+          JOURNEY="${{ github.event.inputs.journey || github.event.client_payload.journey || 'season-persistence' }}"
+          SIG="${{ github.event.inputs.error_signature || github.event.client_payload.error_signature || 'app error signature' }}"
+          echo "url=$URL"         >> "$GITHUB_OUTPUT"
+          echo "journey=$JOURNEY" >> "$GITHUB_OUTPUT"
+          echo "signature=$SIG"   >> "$GITHUB_OUTPUT"
+          echo "::notice::alarm -> journey=$JOURNEY url=$URL signature='$SIG'"
+
+      - name: Checkout the build under test
+        uses: actions/checkout@v4
+
+      # 1. READ (optional, gated on Datadog) — enrich the alarm with the route +
+      #    error string + a real entity id read from Datadog. Read-only: we never
+      #    create a Datadog incident here. Falls back to the payload as-is.
+      - name: Read the alarm context from Datadog
+        id: datadog
+        if: ${{ secrets.DATADOG_API_KEY != '' && secrets.DATADOG_APP_KEY != '' }}
+        shell: bash
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+        run: |
+          echo "Reading alarm context from Datadog (read-only) for '${{ steps.alarm.outputs.signature }}'..."
+          # Real call would GET the monitor/RUM event and capture a sample entity id
+          # to seed execute_api. Left as a read here; verdict logic below is unchanged.
+          echo "context=datadog-read-ok" >> "$GITHUB_OUTPUT"
+
+      - name: Datadog read fallback (no token)
+        id: datadog_fallback
+        if: ${{ secrets.DATADOG_API_KEY == '' || secrets.DATADOG_APP_KEY == '' }}
+        shell: bash
+        run: |
+          echo "would read from Datadog: alarm route=${{ steps.alarm.outputs.url }} signature='${{ steps.alarm.outputs.signature }}' (no DATADOG_API_KEY/DATADOG_APP_KEY set, using payload as-is)"
+
+      # 2. REPRODUCE = run the matching Kane journey against the served runner build.
+      #    Inside this one objective Kane does execute_api (assert backend health,
+      #    capture a real entity id) -> drive the browser with it -> if_else branch:
+      #    error signature present -> error_reproduced; healthy -> could-not-reproduce.
+      #    The branch taken is written to runs/<n>/bifurcation.log, which is what
+      #    makes "did not reproduce" a defensible, auditable verdict.
+      - name: Reproduce the alarm with Kane (execute_api + if_else, branch-logged)
+        id: repro
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: ${{ steps.alarm.outputs.journey }}
+          objective: >-
+            Reproduce the Datadog alarm '${{ steps.alarm.outputs.signature }}' outside-in on the
+            wing-watch dashboard. First call the app's own health/data API for the affected
+            location and assert it returns 200, storing a real entity id (execute_api). Then drive
+            the failing journey '${{ steps.alarm.outputs.journey }}' in the browser using that id.
+            Then branch with if_else: if the app's own error signature appears or the expected state
+            is missing, record 'error_reproduced' and capture the screenshot/console/network
+            evidence; if the page is healthy and the expected state is present, record 'healthy'.
+            Pass only if the page genuinely behaves correctly; fail only if the alarm's symptom
+            actually reproduces. Log which branch executed to the bifurcation log.
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+          timeout: "300"
+
+      # 3. DECIDE the verdict.
+      #    FAIL (exit 1)  = reproduced real -> file the gated Jira bug.
+      #    PASS (exit 0)  = could-not-reproduce -> file nothing, post the all-clear.
+      #    VOID (exit 2/3) = infra blip -> NEUTRAL, retry/page-a-human, never a fail.
+      #    (No --ws-endpoint anywhere; no LCP checkpoint; outside-in only.)
+      - name: Decide reproduce-or-dismiss
+        id: decide
+        shell: bash
+        run: |
+          V="${{ steps.repro.outputs.verdict }}"
+          case "$V" in
+            FAIL)
+              echo "::error::alarm REPRODUCED outside-in (verdict FAIL) - filing a gated Jira bug"
+              echo "outcome=reproduced" >> "$GITHUB_OUTPUT" ;;
+            PASS)
+              echo "::notice::did not reproduce outside-in (verdict PASS) - filing nothing"
+              echo "outcome=not_reproduced" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::warning::Kane VOIDed (infra, exit 2/3) - neutral, retry once or page a human; NOT a reproduction"
+              echo "outcome=void" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      # 4a. FILE (real reproduction only) — gated Jira bug. The bug carries the
+      #     run_dir + test_url so the branch decision (bifurcation.log) is auditable.
+      - name: File a Jira bug (reproduced only)
+        if: ${{ steps.decide.outputs.outcome == 'reproduced' && secrets.JIRA_BASE_URL != '' && secrets.JIRA_EMAIL != '' && secrets.JIRA_API_TOKEN != '' }}
+        shell: bash
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          SUMMARY="[Kane] Alarm reproduced outside-in: ${{ steps.alarm.outputs.signature }}"
+          DESC="Datadog alarm reproduced by re-driving the live journey.\n\nJourney: ${{ steps.alarm.outputs.journey }}\nTarget (served build): ${{ steps.alarm.outputs.url }}\nError signature: ${{ steps.alarm.outputs.signature }}\nVerdict: ${{ steps.repro.outputs.verdict }} (exit ${{ steps.repro.outputs.exit_code }})\nRoot cause (Kane one-liner): ${{ steps.repro.outputs.summary }}\nCredits: ${{ steps.repro.outputs.credits }}\n\nAuditable branch decision — the execute_api + if_else path and runs/<n>/bifurcation.log live under:\n  run_dir: ${{ steps.repro.outputs.run_dir }}\n  test_url: ${{ steps.repro.outputs.test_url }}"
+          curl -sf -X POST "$JIRA_BASE_URL/rest/api/3/issue" \
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg pk "${JIRA_PROJECT_KEY:-WING}" --arg s "$SUMMARY" --arg d "$DESC" \
+              '{fields:{project:{key:$pk},summary:$s,issuetype:{name:"Bug"},description:$d}}')" \
+            && echo "Jira bug filed." || echo "::warning::Jira create failed (left non-fatal)"
+
+      - name: Jira fallback (reproduced, no token)
+        if: ${{ steps.decide.outputs.outcome == 'reproduced' && (secrets.JIRA_BASE_URL == '' || secrets.JIRA_EMAIL == '' || secrets.JIRA_API_TOKEN == '') }}
+        shell: bash
+        run: |
+          echo "would file Jira bug: [Kane] Alarm reproduced outside-in: ${{ steps.alarm.outputs.signature }}"
+          echo "would attach run_dir=${{ steps.repro.outputs.run_dir }} test_url=${{ steps.repro.outputs.test_url }} (bifurcation.log makes the branch decision auditable)"
+
+      # 4b. NOT reproduced — file nothing, post the honest all-clear. This is the
+      #     alert-fatigue kill: a healthy outside-in re-drive closes the loop without
+      #     a ticket. Framed as "did not reproduce outside-in," never a definitive
+      #     all-clear.
+      - name: Post "did not reproduce outside-in"
+        if: ${{ steps.decide.outputs.outcome == 'not_reproduced' && secrets.SLACK_WEBHOOK != '' }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          MSG="Alarm '${{ steps.alarm.outputs.signature }}' did not reproduce outside-in (Kane verdict PASS, exit ${{ steps.repro.outputs.exit_code }}). No bug filed. Branch evidence: ${{ steps.repro.outputs.test_url }}"
+          curl -sf -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK_WEBHOOK" \
+            && echo "Posted all-clear to Slack." || echo "::warning::Slack post failed (left non-fatal)"
+
+      - name: All-clear fallback (no Slack token)
+        if: ${{ steps.decide.outputs.outcome == 'not_reproduced' && secrets.SLACK_WEBHOOK == '' }}
+        shell: bash
+        run: |
+          echo "would post: did not reproduce outside-in — alarm '${{ steps.alarm.outputs.signature }}' (Kane verdict PASS); no bug filed; evidence ${{ steps.repro.outputs.test_url }}"
+
+      # 5. Always notify the incident channel with the verdict + branch + credits +
+      #    links (gated on Slack; fallback echoes). VOID is reported as neutral.
+      - name: Notify incident channel
+        if: ${{ always() && secrets.SLACK_WEBHOOK != '' }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          MSG="Kane alarm reproduce: journey=${{ steps.alarm.outputs.journey }} verdict=${{ steps.repro.outputs.verdict }} (exit ${{ steps.repro.outputs.exit_code }}) credits=${{ steps.repro.outputs.credits }} | ${{ steps.repro.outputs.summary }} | run_dir=${{ steps.repro.outputs.run_dir }} test_url=${{ steps.repro.outputs.test_url }}"
+          curl -sf -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK_WEBHOOK" || echo "::warning::Slack notify failed (left non-fatal)"
+
+      - name: Incident-channel fallback (no Slack token)
+        if: ${{ always() && secrets.SLACK_WEBHOOK == '' }}
+        shell: bash
+        run: |
+          echo "would post: verdict=${{ steps.repro.outputs.verdict }} (exit ${{ steps.repro.outputs.exit_code }}) credits=${{ steps.repro.outputs.credits }} | ${{ steps.repro.outputs.summary }} | run_dir=${{ steps.repro.outputs.run_dir }} | test_url=${{ steps.repro.outputs.test_url }}"

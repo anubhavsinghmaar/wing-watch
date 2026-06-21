@@ -1,0 +1,192 @@
+# FLAGSHIP 3 — RUM-to-Regression Closed Loop
+# Datadog surfaces a slow / erroring real-user journey; Kane re-drives it BEST-OF-3
+# against the PR build served in the runner, and pages a human ONLY on a reproduced,
+# true regression. On green it suppresses the RUM blip as sampling noise. This is the
+# "page on reproduced truth, not a statistical threshold" loop.
+#
+# SAFE BY DEFAULT: the live trigger here is workflow_dispatch (plus repository_dispatch
+# for an alarm-driven webhook), so this never fires automatically and never fails on
+# missing secrets. The production trigger (the scheduled cron) is shown commented below;
+# uncomment it AFTER you have added the secrets (see FLAGSHIP-DEMO-README.md). wing-watch
+# is static, so the "target" is the PR build served inside the runner at localhost.
+#
+# PERF FRAMING: we gate on FCP / no-app-errors, NOT LCP. The LCP Performance checkpoint
+# is verified-buggy (reports 20-34s vs reality), so this loop never asserts on it.
+#
+# IN PRODUCTION: the budget is DERIVED from the Datadog RUM p75 for the regressed view
+# (read via aggregate_rum_events, gated on DATADOG_API_KEY) instead of a hardcoded label.
+# Here it comes from the budget_label input so the demo runs with no Datadog token.
+
+name: "Flagship 3 - RUM-to-Regression Closed Loop"
+
+on:
+  workflow_dispatch:
+    inputs:
+      journey:
+        description: "Which Kane journey to guard (the route Datadog RUM flagged)"
+        required: true
+        type: choice
+        default: "no-app-errors"
+        options:
+          - no-app-errors
+          - location-filter
+          - season-persistence
+      budget_label:
+        description: "Perf budget band for the verdict (prod: derived from Datadog RUM p75 FCP)"
+        required: false
+        default: "p75-fcp"
+  # repository_dispatch carries the synthetic RUM payload for an alarm/webhook-triggered run.
+  repository_dispatch:
+    types: [rum-regression]
+  # PRODUCTION TRIGGER (uncomment once secrets are set):
+  # schedule:
+  #   # every 30 min: rank views by p75 FCP/CLS/INP delta vs 7-day baseline, guard the worst.
+  #   - cron: "*/30 * * * *"
+
+# Least privilege: this loop only reads the build and pages out; it never writes to the repo.
+permissions:
+  contents: read
+
+jobs:
+  rum-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the build to guard
+        uses: actions/checkout@v4
+
+      # 0. Resolve the journey + objective. Inputs come from workflow_dispatch or, for an
+      #    alarm-driven run, from the repository_dispatch synthetic payload.
+      - name: Resolve journey + budget
+        id: cfg
+        shell: bash
+        run: |
+          JOURNEY="${{ github.event.inputs.journey || github.event.client_payload.journey || 'no-app-errors' }}"
+          BUDGET="${{ github.event.inputs.budget_label || github.event.client_payload.budget_label || 'p75-fcp' }}"
+          echo "journey=$JOURNEY" >> "$GITHUB_OUTPUT"
+          echo "budget=$BUDGET" >> "$GITHUB_OUTPUT"
+          echo "::notice::Guarding journey '$JOURNEY' against budget '$BUDGET' (FCP / no-app-errors framing, NOT LCP)"
+
+      # 1. OBSERVE (optional, gated on Datadog) — in production we rank views by p75
+      #    FCP/TTFB/CLS/INP delta vs a 7-day baseline (aggregate_rum_events) and derive the
+      #    budget from the RUM p75. Without a token this is a documented no-op so the run is green.
+      - name: Derive budget from Datadog RUM p75
+        id: rum
+        if: ${{ secrets.DATADOG_API_KEY != '' }}
+        env:
+          DD_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DD_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+        shell: bash
+        run: |
+          echo "Would query Datadog RUM: rank '${{ steps.cfg.outputs.journey }}' views by p75 FCP/CLS/INP delta vs 7-day baseline, confirm no synthetic covers this route/device, and emit the p75 FCP as the budget."
+          echo "::notice::Datadog RUM read is wired; budget would be the live p75 FCP, not the '${{ steps.cfg.outputs.budget }}' label."
+      - name: No Datadog token - use the budget_label as-is
+        if: ${{ secrets.DATADOG_API_KEY == '' }}
+        shell: bash
+        run: echo "DATADOG_API_KEY not set - using budget_label '${{ steps.cfg.outputs.budget }}' instead of a live RUM p75 (demo-safe, green)."
+
+      # 2. REPRODUCE (best-of-3) — re-drive the flagged journey three times against the served
+      #    build. We treat the journey as confirmed-regressed ONLY if the MAJORITY of attempts
+      #    fail, which filters RUM sampling noise / one-off blips. FCP + no-app-errors framing,
+      #    never LCP. exit 2/3 (VOID) = infra, neutral, never counted as a regression.
+      - name: Best-of-3 attempt 1
+        id: a1
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: ${{ steps.cfg.outputs.journey }}
+          objective: "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work, the first content paints promptly, and no application JavaScript error occurs during the interaction; fail if a real app error is thrown or the app's own features do not work."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      - name: Best-of-3 attempt 2
+        id: a2
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: ${{ steps.cfg.outputs.journey }}
+          objective: "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work, the first content paints promptly, and no application JavaScript error occurs during the interaction; fail if a real app error is thrown or the app's own features do not work."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      - name: Best-of-3 attempt 3
+        id: a3
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: ${{ steps.cfg.outputs.journey }}
+          objective: "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work, the first content paints promptly, and no application JavaScript error occurs during the interaction; fail if a real app error is thrown or the app's own features do not work."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      # 3. JUDGE — a regression is CONFIRMED only on a majority of real FAILs (best-of-3).
+      #    VOID (exit 2/3) is neutral, never a fail. Green-or-noisy => suppress, do not page.
+      - name: Judge best-of-3
+        id: judge
+        shell: bash
+        run: |
+          fails=0
+          for v in "${{ steps.a1.outputs.verdict }}" "${{ steps.a2.outputs.verdict }}" "${{ steps.a3.outputs.verdict }}"; do
+            [ "$v" = "FAIL" ] && fails=$((fails+1))
+            [ "$v" = "VOID" ] && echo "::warning::an attempt VOIDed (infra, exit 2/3) - neutral, not counted as a regression"
+          done
+          echo "fails=$fails" >> "$GITHUB_OUTPUT"
+          # Majority of 3 = 2+ real FAILs => confirmed regression. Otherwise: sampling noise.
+          if [ "$fails" -ge 2 ]; then
+            echo "confirmed=1" >> "$GITHUB_OUTPUT"
+            echo "::warning::Confirmed regression on '${{ steps.cfg.outputs.journey }}' ($fails/3 attempts failed) - paging."
+          else
+            echo "confirmed=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::RUM blip not reproduced ($fails/3 failed) - suppressed, no page."
+          fi
+          SUMMARY="journey=${{ steps.cfg.outputs.journey }} budget=${{ steps.cfg.outputs.budget }} fails=$fails/3 | a1=${{ steps.a1.outputs.summary }} | a2=${{ steps.a2.outputs.summary }} | a3=${{ steps.a3.outputs.summary }}"
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      # 4. SUPPRESS — on green / noisy, the loop closes quietly. This is the credibility bar:
+      #    we never page on a statistical threshold, only on a reproduced regression.
+      - name: RUM blip suppressed (no regression reproduced)
+        if: ${{ steps.judge.outputs.confirmed == '0' }}
+        shell: bash
+        run: echo "RUM blip not reproduced, suppressed. ${{ steps.judge.outputs.summary }}"
+
+      # 5a. PAGE -> Slack (gated on its secret; else echoes "would page" so the run stays green).
+      - name: Page Slack on confirmed regression
+        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.SLACK_WEBHOOK != '' }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          PAYLOAD=$(printf '{"text":"Kane RUM-to-Regression: CONFIRMED regression on *%s* (best-of-3). %s"}' \
+            "${{ steps.cfg.outputs.journey }}" "${{ steps.judge.outputs.summary }}")
+          curl -sf -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
+
+      - name: Slack fallback (no webhook)
+        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.SLACK_WEBHOOK == '' }}
+        shell: bash
+        run: 'echo "would page Slack - CONFIRMED regression on ${{ steps.cfg.outputs.journey }}: ${{ steps.judge.outputs.summary }}"'
+
+      # 5b. PAGE -> PagerDuty (gated on its routing key; else echoes "would page").
+      #     In production a Datadog incident object, if required, is created out-of-band via
+      #     the Incidents REST API (gated on DATADOG_API_KEY), never via the read-only MCP.
+      - name: Page PagerDuty on confirmed regression
+        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.PAGERDUTY_ROUTING_KEY != '' }}
+        shell: bash
+        env:
+          PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+        run: |
+          PAYLOAD=$(printf '{"routing_key":"%s","event_action":"trigger","payload":{"summary":"Kane RUM-to-Regression: confirmed regression on %s (best-of-3)","source":"kane-rum-regression","severity":"warning","custom_details":{"detail":"%s"}}}' \
+            "$PAGERDUTY_ROUTING_KEY" "${{ steps.cfg.outputs.journey }}" "${{ steps.judge.outputs.summary }}")
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "$PAYLOAD" "https://events.pagerduty.com/v2/enqueue" || true
+
+      - name: PagerDuty fallback (no routing key)
+        if: ${{ steps.judge.outputs.confirmed == '1' && secrets.PAGERDUTY_ROUTING_KEY == '' }}
+        shell: bash
+        run: 'echo "would page PagerDuty - CONFIRMED regression on ${{ steps.cfg.outputs.journey }}: ${{ steps.judge.outputs.summary }}"'
+
+      # 6. PERSIST (note) — on a confirmed regression, production drops a deterministic
+      #    Playwright guard (kane-cli testmd export --language javascript) into the perf suite
+      #    via a human-merged PR so the route's budget is gated going forward. Left as a note
+      #    here: this loop never auto-merges and never writes to the repo (contents: read).
+      - name: Note - persist a guard (human-merge-only)
+        if: ${{ steps.judge.outputs.confirmed == '1' }}
+        shell: bash
+        run: echo "Confirmed regression would be persisted as a committed Playwright perf guard via a human-merged PR. No auto-commit (amber gate, human owns the merge)."

@@ -1,0 +1,81 @@
+name: "Kane journey"
+description: "Serve wing-watch in the runner and run a Kane CLI natural-language journey, returning a structured verdict. The shared core of every flagship pipeline."
+
+inputs:
+  objective:
+    description: "The natural-language test objective Kane runs"
+    required: true
+  journey:
+    description: "Short journey name (used for filenames/logs)"
+    required: true
+  lt-username:
+    description: "LambdaTest username (from secrets)"
+    required: true
+  lt-access-key:
+    description: "LambdaTest access key (from secrets); Basic auth, does not expire mid-run"
+    required: true
+  port:
+    description: "Local serve port"
+    required: false
+    default: "8080"
+  timeout:
+    description: "Kane run timeout (seconds)"
+    required: false
+    default: "180"
+
+outputs:
+  verdict:   { description: "PASS | FAIL | VOID", value: "${{ steps.run.outputs.verdict }}" }
+  exit_code: { description: "Kane exit code 0/1/2/3", value: "${{ steps.run.outputs.exit_code }}" }
+  credits:   { description: "credits consumed", value: "${{ steps.run.outputs.credits }}" }
+  run_dir:   { description: "Kane run dir (screenshots/network/console)", value: "${{ steps.run.outputs.run_dir }}" }
+  test_url:  { description: "Test Manager session URL", value: "${{ steps.run.outputs.test_url }}" }
+  summary:   { description: "Kane one-liner / reason", value: "${{ steps.run.outputs.summary }}" }
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+    - uses: browser-actions/setup-chrome@v1
+    - name: Install Kane CLI
+      shell: bash
+      run: npm install -g @testmuai/kane-cli
+
+    - name: Authenticate Kane (Basic auth)
+      shell: bash
+      env:
+        LT_USERNAME: ${{ inputs.lt-username }}
+        LT_ACCESS_KEY: ${{ inputs.lt-access-key }}
+      run: kane-cli login --username "$LT_USERNAME" --access-key "$LT_ACCESS_KEY"
+
+    - name: Serve wing-watch in the runner (per-PR build, no external deploy needed)
+      shell: bash
+      run: |
+        npx --yes serve -l ${{ inputs.port }} . > /tmp/serve.log 2>&1 &
+        for i in $(seq 1 30); do
+          curl -sf -o /dev/null "http://localhost:${{ inputs.port }}/" && break
+          sleep 1
+        done
+
+    - name: Run Kane journey
+      id: run
+      shell: bash
+      run: |
+        set +e
+        kane-cli run "${{ inputs.objective }}" \
+          --url "http://localhost:${{ inputs.port }}/" \
+          --headless --agent --timeout ${{ inputs.timeout }} \
+          > "/tmp/kane_${{ inputs.journey }}.ndjson" 2>&1
+        rc=$?
+        python3 "${{ github.action_path }}/../../../scripts/parse_kane.py" "/tmp/kane_${{ inputs.journey }}.ndjson" "$rc" >> "$GITHUB_OUTPUT"
+        echo "--- Kane journey '${{ inputs.journey }}' finished, exit $rc ---"
+        tail -3 "/tmp/kane_${{ inputs.journey }}.ndjson" || true
+
+    - name: Upload Kane evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kane-${{ inputs.journey }}
+        path: /tmp/kane_${{ inputs.journey }}.ndjson
+        if-no-files-found: ignore

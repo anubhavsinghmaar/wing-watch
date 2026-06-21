@@ -1,0 +1,220 @@
+# FLAGSHIP 2 — Sentinel: Incident-to-Regression Loop
+# A synthetic production incident becomes a reproduced bug, a committed regression
+# note, a linked Jira bug and a Slack incident post — the same run, with zero
+# hand-authored tests. Kane re-drives the failing journey to PROVE it is red before
+# anyone files anything; if it cannot reproduce, it files NOTHING.
+#
+# SAFE BY DEFAULT: the live triggers here are workflow_dispatch (manual demo) and
+# repository_dispatch carrying a SYNTHETIC incident payload, so this never fires on
+# real production traffic and never fails on missing secrets. Every external leg
+# (Datadog read, Jira, Slack) is gated on its secret and has a green "would post"
+# fallback. The production webhook trigger is shown commented below; uncomment it
+# AFTER you have added the secrets (see FLAGSHIP-DEMO-README.md). wing-watch is
+# static, so the "staging mirror" is the repo build served inside the runner at
+# localhost — the only target Kane ever drives.
+
+name: "Flagship 2 - Sentinel (Incident-to-Regression)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Failing URL from the incident (path on the served wing-watch build)"
+        required: true
+        default: "/"
+      journey:
+        description: "Journey the incident maps to (season-persistence | location-filter | no-app-errors)"
+        required: true
+        default: "season-persistence"
+      error_signature:
+        description: "The app's own error signature seen in the incident"
+        required: true
+        default: "seasonal status lost after reload"
+  repository_dispatch:
+    types: [incident]
+  # PRODUCTION TRIGGER (uncomment once secrets are set):
+  # Datadog monitor -> webhook -> POST repos/<owner>/<repo>/dispatches
+  #   { "event_type": "incident",
+  #     "client_payload": { "url": "...", "journey": "...", "error_signature": "..." } }
+  # The repository_dispatch line above already receives it; nothing else to add.
+
+permissions:
+  contents: write       # commit the regression note + open a guarded branch
+  issues: write         # (reserved) link/track the incident if needed
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the build under test
+        uses: actions/checkout@v4
+
+      # 0. Normalize the incident payload from EITHER trigger into one place.
+      #    repository_dispatch carries client_payload.*; workflow_dispatch carries inputs.*
+      - name: Assemble incident payload
+        id: incident
+        shell: bash
+        run: |
+          URL="${{ github.event.client_payload.url || github.event.inputs.url }}"
+          JOURNEY="${{ github.event.client_payload.journey || github.event.inputs.journey }}"
+          SIG="${{ github.event.client_payload.error_signature || github.event.inputs.error_signature }}"
+          INCIDENT_ID="inc-$(date +%Y%m%d)-${GITHUB_RUN_ID}"
+          {
+            echo "url=${URL:-/}"
+            echo "journey=${JOURNEY:-no-app-errors}"
+            echo "signature=${SIG:-unknown error signature}"
+            echo "incident_id=${INCIDENT_ID}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Sentinel incident ${INCIDENT_ID} journey=${JOURNEY} url=${URL}"
+
+      # 1. RECONSTRUCT — enrich from Datadog IF a key is set, else use the dispatch
+      #    payload directly (Datadog MCP is read-only; we never create incidents here).
+      - name: Read Datadog context (gated)
+        id: datadog
+        shell: bash
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+        run: |
+          if [ -n "$DATADOG_API_KEY" ]; then
+            echo "would read: Datadog incident/error-tracking/RUM to enrich the failing journey (failing URL, ordered action names, the 5xx request, device/browser). Read-only; no incident object created here."
+            # Real call would GET the incident + error-tracking issue and merge fields
+            # into the reconstructed journey; left as a guarded no-op in the demo.
+          else
+            echo "::notice::DATADOG_API_KEY not set - using the dispatch payload directly (journey=${{ steps.incident.outputs.journey }}, signature='${{ steps.incident.outputs.signature }}')"
+          fi
+
+      # 2. REPRODUCE — re-drive the matching Kane journey against the served runner
+      #    build. We EXPECT this to FAIL on the seeded bug (exit 1 = reproduced).
+      #    The objective is the committed journey text; Kane authors/replays it the
+      #    same way every other flagship pipeline does. No --ws-endpoint; static
+      #    site served at localhost is the only controlled target.
+      - name: Reproduce the incident with Kane
+        id: repro
+        uses: ./.github/actions/kane-journey
+        with:
+          journey: ${{ steps.incident.outputs.journey }}
+          objective: "On the wing-watch dashboard, reproduce this reported incident: '${{ steps.incident.outputs.signature }}'. Exercise the affected journey (set a bird's seasonal status for a location then reload, or apply the Location filter, as the incident describes) and watch for the app's own error signature or lost state. Report FAIL if the reported symptom genuinely reproduces; PASS only if the app behaves correctly and the symptom cannot be reproduced."
+          lt-username: ${{ secrets.LT_USERNAME }}
+          lt-access-key: ${{ secrets.LT_ACCESS_KEY }}
+
+      # 3. CLASSIFY — reproduced vs not. exit 1 / FAIL = reproduced (real bug).
+      #    exit 2/3 (VOID) = infra; treat as neutral/retry, NEVER a hard fail — we
+      #    do not file tickets on infra blips.
+      - name: Classify reproduction
+        id: verdict
+        shell: bash
+        run: |
+          V="${{ steps.repro.outputs.verdict }}"
+          if [ "$V" = "FAIL" ]; then
+            echo "reproduced=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::Incident REPRODUCED (Kane verdict FAIL) - filing regression note + Jira + Slack"
+          elif [ "$V" = "VOID" ]; then
+            echo "reproduced=void"  >> "$GITHUB_OUTPUT"
+            echo "::warning::Kane VOIDed (infra/exit 2|3) - neutral, retry later, filing nothing"
+          else
+            echo "reproduced=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Could NOT reproduce (Kane verdict PASS) - human triage, filing nothing"
+          fi
+
+      # 4a. REPRODUCED -> write & commit a regression note pointing at the journey
+      #     library, on a GUARDED branch (never main, never auto-merged — a human
+      #     opens/reviews the PR from this branch).
+      - name: Commit regression note on a guarded branch
+        if: ${{ steps.verdict.outputs.reproduced == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          INC="${{ steps.incident.outputs.incident_id }}"
+          BRANCH="sentinel/regression-${INC}"
+          NOTE=".lambdatest/regressions/${INC}.md"
+          git config user.name  "sentinel-bot"
+          git config user.email "sentinel-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          mkdir -p .lambdatest/regressions
+          cat > "$NOTE" <<EOF
+          # Regression: ${INC}
+
+          Reproduced from a synthetic incident by Sentinel.
+
+          - Journey: \`${{ steps.incident.outputs.journey }}\` (see \`.lambdatest/journeys.json\`)
+          - Failing URL: \`${{ steps.incident.outputs.url }}\`
+          - Error signature: ${{ steps.incident.outputs.signature }}
+          - Kane verdict: ${{ steps.repro.outputs.verdict }} (exit ${{ steps.repro.outputs.exit_code }})
+          - Evidence: ${{ steps.repro.outputs.summary }}
+          - Run dir (screenshots/network/console): ${{ steps.repro.outputs.run_dir }}
+          - Test Manager: ${{ steps.repro.outputs.test_url }}
+
+          This journey now stands as a regression guard. In production the first run
+          authors a \`_test.md\` committed under \`.lambdatest/journeys/\` so later runs
+          replay deterministically (\`kane-cli testmd run\`) and the cached replay is
+          what gates merge. Human opens the PR from \`${BRANCH}\` — never auto-merged.
+          EOF
+          git add "$NOTE"
+          git commit -m "sentinel: regression note for ${INC} (${{ steps.incident.outputs.journey }})"
+          git push origin "$BRANCH" || echo "::warning::push failed (need contents:write + branch allowed) - note staged locally"
+          echo "::notice::Regression note committed to guarded branch ${BRANCH}"
+
+      # 4b. REPRODUCED -> Jira bug (gated on JIRA secrets). Real createIssue with the
+      #     Kane test_url + run_dir; else a green "would create" fallback.
+      - name: File Jira bug (gated)
+        if: ${{ steps.verdict.outputs.reproduced == 'true' }}
+        shell: bash
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          SUMMARY="[Sentinel] ${{ steps.incident.outputs.incident_id }}: ${{ steps.incident.outputs.signature }}"
+          DESC="Reproduced via Kane. Journey=${{ steps.incident.outputs.journey }} URL=${{ steps.incident.outputs.url }}. Verdict=${{ steps.repro.outputs.verdict }} (exit ${{ steps.repro.outputs.exit_code }}). Kane test_url=${{ steps.repro.outputs.test_url }} run_dir=${{ steps.repro.outputs.run_dir }}. Evidence: ${{ steps.repro.outputs.summary }}"
+          if [ -n "$JIRA_API_TOKEN" ] && [ -n "$JIRA_BASE_URL" ]; then
+            curl -sf -X POST "${JIRA_BASE_URL}/rest/api/3/issue" \
+              -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" --arg d "$DESC" \
+                    '{fields:{project:{key:$p},issuetype:{name:"Bug"},summary:$s,
+                      description:{type:"doc",version:1,content:[{type:"paragraph",content:[{type:"text",text:$d}]}]}}}')" \
+              && echo "::notice::Jira bug created" \
+              || echo "::warning::Jira createIssue call failed (check JIRA_* secrets)"
+          else
+            echo "would create Jira bug: $SUMMARY"
+            echo "  -> $DESC"
+          fi
+
+      # 4c. REPRODUCED -> Slack post to the incident channel (gated on SLACK_WEBHOOK).
+      - name: Post to Slack incident channel (gated)
+        if: ${{ steps.verdict.outputs.reproduced == 'true' }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          MSG=":rotating_light: *Sentinel reproduced ${{ steps.incident.outputs.incident_id }}* — journey \`${{ steps.incident.outputs.journey }}\` is RED. Kane verdict ${{ steps.repro.outputs.verdict }} (exit ${{ steps.repro.outputs.exit_code }}). ${{ steps.repro.outputs.summary }} Test Manager: ${{ steps.repro.outputs.test_url }}"
+          if [ -n "$SLACK_WEBHOOK" ]; then
+            curl -sf -X POST -H 'Content-type: application/json' \
+              --data "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK_WEBHOOK" \
+              && echo "::notice::Posted to Slack" \
+              || echo "::warning::Slack post failed (check SLACK_WEBHOOK)"
+          else
+            echo "would post: $MSG"
+          fi
+
+      # 5. NOT REPRODUCED -> say so, file nothing. (PASS = symptom not reproduced.)
+      #    Slack-gated like the others; green fallback when SLACK_WEBHOOK is unset.
+      - name: Could-not-reproduce, human triage (gated)
+        if: ${{ steps.verdict.outputs.reproduced == 'false' }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          MSG=":mag: *Sentinel could NOT reproduce ${{ steps.incident.outputs.incident_id }}* outside-in — journey \`${{ steps.incident.outputs.journey }}\` passed (verdict ${{ steps.repro.outputs.verdict }}). Handing to human triage. No ticket filed."
+          if [ -n "$SLACK_WEBHOOK" ]; then
+            curl -sf -X POST -H 'Content-type: application/json' \
+              --data "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK_WEBHOOK" \
+              && echo "::notice::Posted could-not-reproduce to Slack" \
+              || echo "::warning::Slack post failed (check SLACK_WEBHOOK)"
+          else
+            echo "would post: $MSG"
+          fi
+          echo "::notice::Filed nothing - this is the honest 'reproduce or dismiss' path."

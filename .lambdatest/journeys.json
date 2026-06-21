@@ -1,0 +1,7 @@
+{
+  "_comment": "Natural-language Kane journeys for wing-watch. The flagship pipelines feed these to the kane-journey composite action. In production, the first run authors a _test.md per journey and commits it under .lambdatest/journeys/ so later runs replay deterministically (kane-cli testmd run) instead of re-authoring; the cached replay is what gates merge.",
+  "location-filter": "On the wing-watch dashboard, use the Location filter to select a single birding location. Pass only if the page genuinely updates to show that location's birds and season board; fail if the filter does not actually change the displayed data.",
+  "season-persistence": "On the wing-watch dashboard, set a bird's seasonal status for a location, then reload the page. Pass only if that status genuinely persisted across the reload and is still set; fail if the status was lost after reloading.",
+  "no-app-errors": "Open the wing-watch dashboard and exercise the Location filter and the season board. Pass only if the app's own features work and no application JavaScript error occurs during the interaction; fail if a real app error is thrown.",
+  "seeded-api": "[execute_api demo, needs the optional mock API] Call POST /api/sightings to seed a sighting, store the returned id, open the dashboard for that location, and assert the seeded sighting is reflected. Pass only if the seeded state genuinely appears; fail otherwise."
+}
